@@ -1,5 +1,7 @@
 # Financial Assistant — Working Agreement
 
+> See [PENDING_FIXES.md](PENDING_FIXES.md) for known blockers and their planned solutions (currently: native-code libraries blocked until we have an Apple Developer account).
+
 ## Who's working on this
 The user has limited coding experience. They need to understand every change before it happens — no exceptions, no batching multiple changes "to save time."
 
