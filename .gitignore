@@ -31,6 +31,7 @@ yarn-error.*
 *.pem
 
 # local env files
+.env
 .env*.local
 
 # typescript
@@ -42,3 +43,6 @@ yarn-error.*
 
 # screen recordings used for debugging
 *.mp4
+
+# separate "brain" project (own git repo, not part of this app)
+/Financial_Advisor/

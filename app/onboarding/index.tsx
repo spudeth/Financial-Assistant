@@ -8,7 +8,7 @@ export default function Onboarding() {
       <Text className="text-textMuted text-center mb-lg">
         Onboarding placeholder — voice-driven transaction tracking starts here.
       </Text>
-      <Link href="/(tabs)/chat" asChild>
+      <Link href="/onboarding/login" asChild>
         <Pressable className="bg-primary rounded-md px-lg py-sm">
           <Text className="text-background font-semibold">Get Started</Text>
         </Pressable>

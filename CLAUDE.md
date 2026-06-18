@@ -1,5 +1,8 @@
 # Financial Assistant — Working Agreement
 
+## What this app is
+A voice-driven financial assistant: the user talks to it like a chat assistant, and it tracks their transactions/spending. The "brain" (Claude API integration + a Postgres database schema designed for those calls) is being built separately by the user and will be wired in later — this repo is currently just the native iOS app's UI (chat interface, history, settings/profile, onboarding).
+
 > See [PENDING_FIXES.md](PENDING_FIXES.md) for known blockers and their planned solutions (currently: native-code libraries blocked until we have an Apple Developer account).
 
 ## Who's working on this
@@ -19,11 +22,6 @@ The user has limited coding experience. They need to understand every change bef
 - **Never run `npm audit fix --force`** or similar broad auto-upgrade commands — it silently bumped the whole project to an incompatible Expo SDK version once already.
 - **Terminal commands are run by the user**, not Claude, unless explicitly asked otherwise.
 
-## Current scope: UI only
-- We are only building the visual app (screens, navigation, styling) right now.
-- No backend, no database, no Claude API integration — the user is building "the brain" separately and will wire it in later.
-- `lib/` folder is a placeholder for that future work — do not add real logic there yet.
-
 ## Stack (already set up, do not change without discussion)
 - Expo SDK **54** (must match the version of Expo Go on the user's phone — do not upgrade without checking this first)
 - Expo Router (file-based navigation in `app/`)
@@ -35,3 +33,6 @@ The user has limited coding experience. They need to understand every change bef
 - Chat (`app/(tabs)/chat.tsx`)
 - Chat History (`app/(tabs)/history.tsx`)
 - Settings/Profile (`app/(tabs)/settings.tsx`)
+
+## Other key information 
+- This is a rebuild, user has build 80% of the entire project already, but the app was inconsistant and glitchy. Many componants are already built, save time by asking user for the previous code if applicable

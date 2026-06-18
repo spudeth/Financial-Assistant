@@ -1,5 +1,15 @@
 # Pending Fixes
 
+## Email confirmation links are hardcoded to a dev machine's local IP (won't work at scale)
+
+**Issue:** Supabase email confirmation links (and Google OAuth redirects) need a URL to send the user back to. While testing in ExpoGo, the only reachable address is the dev machine's local network IP, e.g. `exp://172.20.10.2:8081/--`. This is set both in Supabase's Site URL field (Authentication → URL Configuration) and as the `emailRedirectTo` option in `lib/auth.ts`'s `signUpWithEmail`.
+
+**Why it's a problem:** That IP address changes whenever the dev machine switches networks (different WiFi, hotspot, router restart) or whenever a different developer's machine is used. It only works for one person testing on one network at a time — it is not a real solution, just a way to unblock local testing.
+
+**Current workaround:** manually update the IP in both places (Supabase Site URL + `lib/auth.ts`) whenever it stops matching what `npx expo start` prints.
+
+**Solution, once we have a custom dev/production build (see below):** switch the redirect to the app's custom URL scheme (`financialassistant://`) instead of an `exp://` IP address. Custom schemes are registered with the OS by a real build and don't depend on network/IP — but ExpoGo itself doesn't support opening custom schemes, which is why we can't use this yet.
+
 ## Native-code libraries blocked until we have an Apple Developer account
 
 **Issue:** We can't use any library that contains native (Swift/Kotlin) code — for example `react-native-keyboard-controller`, which we installed once to fix keyboard animation jank, then had to fully revert. Plain ExpoGo only supports a fixed, pre-built set of native modules; anything outside that set requires building a custom version of the app.
