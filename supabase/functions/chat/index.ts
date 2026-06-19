@@ -109,6 +109,7 @@ Deno.serve(async (req) => {
       });
 
       const writeMessages = [
+        ...history,
         { role: 'user' as const, content: `Today's date: ${todayIso}\nUser's last 30 days of transactions:\n${JSON.stringify(recent)}\n\nUser message: ${message}` },
       ];
       const resp = await callClaude({ model: MODELS.main, system: writeSystem, messages: writeMessages, tools: writeToolDefs() });
