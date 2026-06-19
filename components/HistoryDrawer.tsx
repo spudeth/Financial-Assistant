@@ -1,43 +1,50 @@
-import { useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { FlatList, Pressable, Text, TextInput, View } from 'react-native';
 import { colors, spacing, radius } from '../theme/theme';
+import { supabase } from '../lib/supabase';
 
-type Thread = { id: string; title: string; preview: string; timestamp: string };
+type Thread = { id: string; title: string; timestamp: string };
 
-const MOCK_THREADS: Thread[] = [
-  {
-    id: '1',
-    title: 'Grocery budget check-in',
-    preview: 'You spent $142 on groceries this week, about 12% under your average.',
-    timestamp: 'Just now',
-  },
-  {
-    id: '2',
-    title: 'Subscription audit',
-    preview: 'Found 3 subscriptions you might not be using: Hulu, Headspace, and Calm.',
-    timestamp: '3h ago',
-  },
-  {
-    id: '3',
-    title: 'Savings goal progress',
-    preview: 'You are 64% toward your $5,000 emergency fund goal.',
-    timestamp: '2d ago',
-  },
-];
+function formatRelative(iso: string): string {
+  const diffMs = Date.now() - new Date(iso).getTime();
+  const mins = Math.floor(diffMs / 60000);
+  if (mins < 1) return 'Just now';
+  if (mins < 60) return `${mins}m ago`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  return `${days}d ago`;
+}
 
 type Props = {
   onClose: () => void;
   onOpenSettings: () => void;
+  onSelectConversation: (id: string) => void;
+  onNewConversation: () => void;
 };
 
-export default function HistoryDrawer({ onClose, onOpenSettings }: Props) {
+export default function HistoryDrawer({ onClose, onOpenSettings, onSelectConversation, onNewConversation }: Props) {
   const [query, setQuery] = useState('');
+  const [threads, setThreads] = useState<Thread[]>([]);
+  const [loading, setLoading] = useState(true);
 
-  const filtered = MOCK_THREADS.filter(
-    (t) =>
-      t.title.toLowerCase().includes(query.toLowerCase()) ||
-      t.preview.toLowerCase().includes(query.toLowerCase())
-  );
+  const load = useCallback(async () => {
+    setLoading(true);
+    const { data } = await supabase
+      .from('conversations')
+      .select('id, title, last_message_at')
+      .order('last_message_at', { ascending: false });
+    setThreads(
+      (data ?? []).map((c) => ({ id: c.id, title: c.title || 'Untitled conversation', timestamp: formatRelative(c.last_message_at) }))
+    );
+    setLoading(false);
+  }, []);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  const filtered = threads.filter((t) => t.title.toLowerCase().includes(query.toLowerCase()));
 
   return (
     <View style={{ flex: 1, backgroundColor: colors.background, paddingTop: 56 }}>
@@ -108,14 +115,16 @@ export default function HistoryDrawer({ onClose, onOpenSettings }: Props) {
         data={filtered}
         keyExtractor={(item) => item.id}
         contentContainerStyle={{ paddingHorizontal: spacing.md }}
+        refreshing={loading}
+        onRefresh={load}
         ListEmptyComponent={
           <Text style={{ color: colors.textMuted, textAlign: 'center', marginTop: spacing.lg }}>
-            {query ? 'No matches.' : 'No conversations yet.'}
+            {loading ? 'Loading…' : query ? 'No matches.' : 'No conversations yet.'}
           </Text>
         }
         renderItem={({ item }) => (
           <Pressable
-            onPress={onClose}
+            onPress={() => onSelectConversation(item.id)}
             style={{
               paddingVertical: spacing.sm,
               borderBottomWidth: 1,
@@ -125,18 +134,13 @@ export default function HistoryDrawer({ onClose, onOpenSettings }: Props) {
             <Text style={{ color: colors.text, fontWeight: '700' }} numberOfLines={2}>
               {item.title}
             </Text>
-            <Text style={{ color: colors.textMuted, marginTop: 2 }} numberOfLines={2}>
-              {item.preview}
-            </Text>
-            <Text style={{ color: colors.textMuted, fontSize: 11, marginTop: 2, opacity: 0.7 }}>
-              {item.timestamp}
-            </Text>
+            <Text style={{ color: colors.textMuted, fontSize: 11, marginTop: 2, opacity: 0.7 }}>{item.timestamp}</Text>
           </Pressable>
         )}
       />
 
       <Pressable
-        onPress={onClose}
+        onPress={onNewConversation}
         style={{
           position: 'absolute',
           bottom: 32,

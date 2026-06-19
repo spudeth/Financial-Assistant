@@ -15,6 +15,16 @@ import {
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { colors } from '../../theme/theme';
+import { supabase } from '../../lib/supabase';
+import {
+  acceptIntent,
+  classifyAccount,
+  editIntent,
+  sendChatMessage,
+  type PendingClassification,
+  type PendingIntent,
+} from '../../lib/api';
+import { ClassifyAccountCard, IntentCard } from '../../components/ConfirmationCard';
 
 const APP_NAME = 'Financial Assistant';
 const USER_NAME = 'Alex';
@@ -148,9 +158,11 @@ function MicButton({ listening, onPress }: { listening: boolean; onPress: () => 
 type Props = {
   onOpenHistory: () => void;
   onOpenSettings: () => void;
+  conversationId?: string;
+  onConversationCreated?: (id: string) => void;
 };
 
-export default function Chat({ onOpenHistory, onOpenSettings }: Props) {
+export default function Chat({ onOpenHistory, onOpenSettings, conversationId, onConversationCreated }: Props) {
   const insets = useSafeAreaInsets();
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
@@ -158,9 +170,37 @@ export default function Chat({ onOpenHistory, onOpenSettings }: Props) {
   const [isBotThinking, setIsBotThinking] = useState(false);
   const [voiceRepliesOn, setVoiceRepliesOn] = useState(false);
   const [listening, setListening] = useState(false);
+  const [pendingIntent, setPendingIntent] = useState<PendingIntent | null>(null);
+  const [intentBusy, setIntentBusy] = useState(false);
+  const [pendingClassifications, setPendingClassifications] = useState<PendingClassification[]>([]);
   const listRef = useRef<FlatList<Message>>(null);
   const greeting = useRef(getGreeting(USER_NAME)).current;
   const keyboardHeight = useRef(new Animated.Value(0)).current;
+  const convoIdRef = useRef<string | undefined>(conversationId);
+
+  useEffect(() => {
+    convoIdRef.current = conversationId;
+    setPendingIntent(null);
+    if (!conversationId) {
+      setMessages([]);
+      return;
+    }
+    (async () => {
+      const { data } = await supabase
+        .from('messages')
+        .select('id, role, content, created_at')
+        .eq('conversation_id', conversationId)
+        .order('created_at', { ascending: true });
+      setMessages(
+        (data ?? []).map((m) => ({
+          id: m.id,
+          role: m.role === 'user' ? 'user' : 'bot',
+          text: m.content,
+          timestamp: new Date(m.created_at),
+        }))
+      );
+    })();
+  }, [conversationId]);
 
   useEffect(() => {
     const animateToKeyboard = (e: KeyboardEvent, toValue: number) => {
@@ -183,7 +223,7 @@ export default function Chat({ onOpenHistory, onOpenSettings }: Props) {
     };
   }, []);
 
-  const sendMessage = (text: string) => {
+  const sendMessage = async (text: string) => {
     const trimmed = text.trim();
     if (!trimmed) return;
 
@@ -193,16 +233,77 @@ export default function Chat({ onOpenHistory, onOpenSettings }: Props) {
     setInputHeight(20);
     setIsBotThinking(true);
 
-    setTimeout(() => {
-      const botMessage: Message = {
-        id: `${Date.now()}-bot`,
+    try {
+      const res = await sendChatMessage(trimmed, convoIdRef.current);
+      if (!convoIdRef.current) {
+        convoIdRef.current = res.conversationId;
+        onConversationCreated?.(res.conversationId);
+      }
+      const botMessage: Message = { id: `${Date.now()}-bot`, role: 'bot', text: res.reply, timestamp: new Date() };
+      setMessages((prev) => [...prev, botMessage]);
+      setPendingIntent(res.pendingIntent);
+      setPendingClassifications(res.pendingClassifications ?? []);
+    } catch (err) {
+      const errorMessage: Message = {
+        id: `${Date.now()}-err`,
         role: 'bot',
-        text: "This is a placeholder reply — I'm not wired up to the real brain yet.",
+        text: `Something went wrong: ${(err as Error).message}`,
         timestamp: new Date(),
       };
-      setMessages((prev) => [...prev, botMessage]);
+      setMessages((prev) => [...prev, errorMessage]);
+    } finally {
       setIsBotThinking(false);
-    }, 1200);
+    }
+  };
+
+  const handleAcceptIntent = async () => {
+    if (!pendingIntent) return;
+    setIntentBusy(true);
+    try {
+      await acceptIntent(pendingIntent);
+      setMessages((prev) => [...prev, { id: `${Date.now()}-saved`, role: 'bot', text: 'Saved.', timestamp: new Date() }]);
+      setPendingIntent(null);
+    } catch (err) {
+      setMessages((prev) => [
+        ...prev,
+        { id: `${Date.now()}-saveerr`, role: 'bot', text: `Couldn't save that: ${(err as Error).message}`, timestamp: new Date() },
+      ]);
+    } finally {
+      setIntentBusy(false);
+    }
+  };
+
+  const handleRejectIntent = () => {
+    setPendingIntent(null);
+    setMessages((prev) => [...prev, { id: `${Date.now()}-rejected`, role: 'bot', text: 'Okay, discarded.', timestamp: new Date() }]);
+  };
+
+  const handleEditIntent = async (instruction: string) => {
+    if (!pendingIntent) return;
+    setIntentBusy(true);
+    try {
+      const res = await editIntent(pendingIntent, instruction);
+      setPendingIntent(res.intent);
+    } catch (err) {
+      setMessages((prev) => [
+        ...prev,
+        { id: `${Date.now()}-editerr`, role: 'bot', text: `Couldn't apply that edit: ${(err as Error).message}`, timestamp: new Date() },
+      ]);
+    } finally {
+      setIntentBusy(false);
+    }
+  };
+
+  const handleClassify = async (accountId: string, groupType: string, isLiability: boolean) => {
+    try {
+      await classifyAccount(accountId, groupType, isLiability);
+      setPendingClassifications((prev) => prev.filter((a) => a.id !== accountId));
+    } catch (err) {
+      setMessages((prev) => [
+        ...prev,
+        { id: `${Date.now()}-classifyerr`, role: 'bot', text: `Couldn't save that: ${(err as Error).message}`, timestamp: new Date() },
+      ]);
+    }
   };
 
   return (
@@ -314,6 +415,28 @@ export default function Chat({ onOpenHistory, onOpenSettings }: Props) {
           ListFooterComponent={isBotThinking ? <ThinkingBubble /> : null}
         />
       </View>
+
+      {/* Pending confirmations stack — grows into its own scroll area when there are several */}
+      {(pendingClassifications.length > 0 || pendingIntent) && (
+        <ScrollView style={{ maxHeight: 260, marginHorizontal: 16, marginBottom: 8 }} contentContainerStyle={{ paddingBottom: 4 }}>
+          {pendingClassifications.map((account) => (
+            <ClassifyAccountCard
+              key={account.id}
+              accountName={account.name}
+              onSubmit={(groupType, isLiability) => handleClassify(account.id, groupType, isLiability)}
+            />
+          ))}
+          {pendingIntent && (
+            <IntentCard
+              intent={pendingIntent}
+              busy={intentBusy}
+              onAccept={handleAcceptIntent}
+              onReject={handleRejectIntent}
+              onEdit={handleEditIntent}
+            />
+          )}
+        </ScrollView>
+      )}
 
       {/* Quick action chips */}
       <ScrollView
