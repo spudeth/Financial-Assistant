@@ -66,7 +66,8 @@ Deno.serve(async (req) => {
 
     if (bucket === 'READ') {
       const { accounts, categories } = await fetchVocab(supabase);
-      const readSystem = buildReadPrompt(accounts, categories);
+      const todayIso = new Date().toISOString().slice(0, 10);
+      const readSystem = buildReadPrompt(accounts, categories, todayIso);
       let messages = [...history, { role: 'user' as const, content: message }];
       // Force a tool call on the first turn — otherwise nothing stops Claude
       // from answering straight out of `history` (which may already contain

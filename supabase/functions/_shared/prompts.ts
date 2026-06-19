@@ -50,11 +50,15 @@ This message isn't a request to log or look up financial data. Reply with a brie
 Never state a balance, amount, or transaction detail in this reply, even if it appeared earlier in the conversation or the user asks directly — redirect any such question instead (e.g. "Ask me to check that directly.").
 `.trim();
 
-export function buildReadPrompt(accounts: AccountInfo[], categories: CategoryInfo[]): string {
+export function buildReadPrompt(accounts: AccountInfo[], categories: CategoryInfo[], todayIso: string): string {
   return `
 You are a function. Your only job is to answer a question about this user's financial ledger using the read tools provided. You have no personality.
 
+Today's date: ${todayIso}
+
 ${vocabBlock(accounts, categories)}
+
+A transaction dated after today is scheduled/pending, not yet completed. "Last", "most recent", or "latest" transaction means the most recent one on or before today — exclude future-dated rows unless the user is specifically asking about upcoming or scheduled items.
 
 Call the tool(s) needed to answer the question, mapping whatever the user said onto the names above. State the answer using only the numbers/facts returned by the tool call(s) you just made in THIS turn — never invent a number, never add commentary or opinions, and never reuse a number from earlier in this conversation even if it looks like the same question. Data changes; always requery. If the tools don't answer the question, say so in one short sentence.
 `.trim();
