@@ -13,17 +13,22 @@ type ReadEntry = {
 
 export const readRegistry: Record<string, ReadEntry> = {
   category_breakdown: {
-    description: 'Spending by category over a date range, with each category\'s amount and % of total.',
+    description: 'Breakdown by category over a date range, with each category\'s amount and % of its type\'s total. Pass type to scope it to income, expense, or transfer; omit type to get all of them together.',
     input_schema: {
       type: 'object',
       properties: {
         start_date: { type: 'string', description: 'YYYY-MM-DD' },
         end_date: { type: 'string', description: 'YYYY-MM-DD' },
+        type: { type: 'string', enum: ['income', 'expense', 'transfer'], description: 'Optional: limit to one transaction type. Omit for all types.' },
       },
       required: ['start_date', 'end_date'],
     },
     call: async (supabase, input) => {
-      const { data, error } = await supabase.rpc('category_breakdown', { p_start: input.start_date, p_end: input.end_date });
+      const { data, error } = await supabase.rpc('category_breakdown', {
+        p_start: input.start_date,
+        p_end: input.end_date,
+        p_type: input.type ?? null,
+      });
       if (error) throw new Error(error.message);
       return data;
     },
