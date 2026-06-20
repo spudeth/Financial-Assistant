@@ -6,7 +6,7 @@ export type PendingClassification = { id: string; name: string };
 export type ChatResponse = {
   reply: string;
   conversationId: string;
-  pendingIntent: PendingIntent | null;
+  pendingIntents: PendingIntent[];
   pendingClassifications: PendingClassification[];
 };
 
@@ -21,8 +21,13 @@ export function sendChatMessage(message: string, conversationId?: string): Promi
   return invoke<ChatResponse>('chat', { message, conversationId });
 }
 
-export function acceptIntent(intent: PendingIntent): Promise<{ executed: true; result: unknown }> {
-  return invoke('confirm', { intent, action: 'accept' });
+export type AcceptResult =
+  | { executed: true; result: unknown }
+  | { executed: false; duplicate: true; message: string };
+
+// force=true skips the soft duplicate check (the "add anyway" path).
+export function acceptIntent(intent: PendingIntent, force = false): Promise<AcceptResult> {
+  return invoke('confirm', { intent, action: 'accept', force });
 }
 
 export function editIntent(intent: PendingIntent, editInstruction: string): Promise<{ executed: false; intent: PendingIntent }> {

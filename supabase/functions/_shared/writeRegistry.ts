@@ -187,6 +187,54 @@ export const writeRegistry: Record<string, WriteHandler> = {
     return data;
   },
 
+  edit_recurring: async (supabase, userId, input) => {
+    const id = requireString(input.id, 'id');
+    const patch = (input.patch as Record<string, unknown>) ?? {};
+
+    const { data: existing, error: fetchErr } = await supabase.from('recurrences').select('*').eq('id', id).single();
+    if (fetchErr || !existing) throw new Error(`Recurring item "${id}" not found`);
+
+    const update: Record<string, unknown> = {};
+    if (patch.amount !== undefined) update.amount = parseAmount(patch.amount);
+    if (patch.payee !== undefined) update.payee = patch.payee;
+    if (patch.note !== undefined) update.note = patch.note;
+    if (patch.next_on !== undefined) update.next_on = patch.next_on;
+    if (patch.end_on !== undefined) update.end_on = patch.end_on;
+    if (patch.frequency !== undefined) {
+      const frequency = requireString(patch.frequency, 'frequency');
+      if (!['weekly', 'biweekly', 'monthly', 'yearly'].includes(frequency)) throw new Error(`"${frequency}" is not a recognized frequency`);
+      update.frequency = frequency;
+    }
+    if (patch.account !== undefined) {
+      update.account_id = await lookupAccountId(supabase, requireString(patch.account, 'account'));
+    }
+    if (patch.category !== undefined) {
+      const category = requireString(patch.category, 'category');
+      update.category_id = await findOrCreateCategory(supabase, userId, category, existing.type === 'income' ? 'income' : 'expense');
+    }
+
+    const { data, error } = await supabase.from('recurrences').update(update).eq('id', id).select().single();
+    if (error) throw new Error(error.message);
+
+    await appendAudit(supabase, userId, 'edit_recurring', 'recurrences', id, existing, data);
+    return data;
+  },
+
+  // Cancel a recurring item (active = false) rather than hard-delete: it stops
+  // generating, drops out of the active list, and past rows that referenced it
+  // stay intact.
+  delete_recurring: async (supabase, userId, input) => {
+    const id = requireString(input.id, 'id');
+    const { data: existing, error: fetchErr } = await supabase.from('recurrences').select('*').eq('id', id).single();
+    if (fetchErr || !existing) throw new Error(`Recurring item "${id}" not found`);
+
+    const { data, error } = await supabase.from('recurrences').update({ active: false }).eq('id', id).select().single();
+    if (error) throw new Error(error.message);
+
+    await appendAudit(supabase, userId, 'delete_recurring', 'recurrences', id, existing, data);
+    return { cancelled: true, id };
+  },
+
   edit_transaction: async (supabase, userId, input) => {
     const id = requireString(input.id, 'id');
     const patch = (input.patch as Record<string, unknown>) ?? {};
@@ -416,6 +464,38 @@ export function writeToolDefs() {
           end: { type: 'string', description: 'YYYY-MM-DD, optional' },
         },
         required: ['type', 'amount', 'category', 'account', 'frequency', 'start'],
+      },
+    },
+    {
+      name: 'edit_recurring',
+      description: 'Change an existing recurring item — a bill or repeating income whose amount, date, frequency, account, or category changed. Look it up first with recurring_transactions to get its id.',
+      input_schema: {
+        type: 'object',
+        properties: {
+          id: { type: 'string' },
+          patch: {
+            type: 'object',
+            properties: {
+              amount: { type: 'number' },
+              category: { type: 'string' },
+              account: { type: 'string' },
+              payee: { type: 'string' },
+              frequency: { type: 'string', enum: ['weekly', 'biweekly', 'monthly', 'yearly'] },
+              next_on: { type: 'string', description: 'YYYY-MM-DD, the next date it hits' },
+              end_on: { type: 'string', description: 'YYYY-MM-DD, optional' },
+            },
+          },
+        },
+        required: ['id', 'patch'],
+      },
+    },
+    {
+      name: 'delete_recurring',
+      description: 'Cancel a recurring item (e.g. a subscription the user stopped). Look it up first with recurring_transactions to get its id.',
+      input_schema: {
+        type: 'object',
+        properties: { id: { type: 'string' } },
+        required: ['id'],
       },
     },
     {

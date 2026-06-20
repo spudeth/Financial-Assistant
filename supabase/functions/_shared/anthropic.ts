@@ -2,10 +2,12 @@ const API_URL = 'https://api.anthropic.com/v1/messages';
 const ANTHROPIC_VERSION = '2023-06-01';
 
 export const MODELS = {
-  // cheap/fast — used only for the first-pass READ/WRITE/CONVERSATIONAL classification
+  // cheap/fast — CSV import classification (chat no longer routes)
   router: 'claude-haiku-4-5-20251001',
-  // full quality — used for composing replies, filling intent objects, and the edit micro-agent
+  // full quality — the chat persona loop, intent objects, and the edit micro-agent
   main: 'claude-sonnet-4-6',
+  // cheap/fast — the background memory-writer that maintains the user profile
+  memory: 'claude-haiku-4-5-20251001',
 };
 
 type ToolDef = { name: string; description: string; input_schema: Record<string, unknown> };

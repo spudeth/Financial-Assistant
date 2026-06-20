@@ -25,6 +25,7 @@ import {
   type PendingIntent,
 } from '../../lib/api';
 import { ClassifyAccountCard, IntentCard } from '../../components/ConfirmationCard';
+import { FormattedMessage } from '../../components/FormattedMessage';
 
 const APP_NAME = 'Financial Assistant';
 const USER_NAME = 'Alex';
@@ -170,17 +171,26 @@ export default function Chat({ onOpenHistory, onOpenSettings, conversationId, on
   const [isBotThinking, setIsBotThinking] = useState(false);
   const [voiceRepliesOn, setVoiceRepliesOn] = useState(false);
   const [listening, setListening] = useState(false);
-  const [pendingIntent, setPendingIntent] = useState<PendingIntent | null>(null);
-  const [intentBusy, setIntentBusy] = useState(false);
+  const [pendingIntents, setPendingIntents] = useState<{ key: string; data: PendingIntent }[]>([]);
+  const [busyKey, setBusyKey] = useState<string | null>(null);
+  const [warnedKeys, setWarnedKeys] = useState<Set<string>>(new Set());
   const [pendingClassifications, setPendingClassifications] = useState<PendingClassification[]>([]);
   const listRef = useRef<FlatList<Message>>(null);
   const greeting = useRef(getGreeting(USER_NAME)).current;
   const keyboardHeight = useRef(new Animated.Value(0)).current;
+  // When the keyboard is open the container is already lifted by its full
+  // height, so this margin is the gap to the keyboard's TOP edge. Shrink it to
+  // ~25% of the closed gap (i.e. 75% closer) as the keyboard rises.
+  const inputMarginBottom = keyboardHeight.interpolate({
+    inputRange: [0, 300],
+    outputRange: [insets.bottom + 12, (insets.bottom + 12) * 0.25],
+    extrapolate: 'clamp',
+  });
   const convoIdRef = useRef<string | undefined>(conversationId);
 
   useEffect(() => {
     convoIdRef.current = conversationId;
-    setPendingIntent(null);
+    setPendingIntents([]);
     if (!conversationId) {
       setMessages([]);
       return;
@@ -241,7 +251,8 @@ export default function Chat({ onOpenHistory, onOpenSettings, conversationId, on
       }
       const botMessage: Message = { id: `${Date.now()}-bot`, role: 'bot', text: res.reply, timestamp: new Date() };
       setMessages((prev) => [...prev, botMessage]);
-      setPendingIntent(res.pendingIntent);
+      const intents = res.pendingIntents ?? [];
+      setPendingIntents(intents.map((data, i) => ({ key: `${Date.now()}-${i}`, data })));
       setPendingClassifications(res.pendingClassifications ?? []);
     } catch (err) {
       const errorMessage: Message = {
@@ -256,41 +267,81 @@ export default function Chat({ onOpenHistory, onOpenSettings, conversationId, on
     }
   };
 
-  const handleAcceptIntent = async () => {
-    if (!pendingIntent) return;
-    setIntentBusy(true);
+  const handleAcceptIntent = async (key: string) => {
+    const item = pendingIntents.find((p) => p.key === key);
+    if (!item) return;
+    const force = warnedKeys.has(key);
+    setBusyKey(key);
     try {
-      await acceptIntent(pendingIntent);
-      setMessages((prev) => [...prev, { id: `${Date.now()}-saved`, role: 'bot', text: 'Saved.', timestamp: new Date() }]);
-      setPendingIntent(null);
+      const res = await acceptIntent(item.data, force);
+      if (res.executed) {
+        setMessages((prev) => [...prev, { id: `${Date.now()}-saved`, role: 'bot', text: 'Saved.', timestamp: new Date() }]);
+        setPendingIntents((prev) => prev.filter((p) => p.key !== key));
+        setWarnedKeys((prev) => {
+          const next = new Set(prev);
+          next.delete(key);
+          return next;
+        });
+      } else {
+        // Soft duplicate — keep the card; a second Accept forces it through.
+        setMessages((prev) => [
+          ...prev,
+          { id: `${Date.now()}-dup`, role: 'bot', text: `${res.message} Tap Accept again to add it anyway.`, timestamp: new Date() },
+        ]);
+        setWarnedKeys((prev) => new Set(prev).add(key));
+      }
     } catch (err) {
       setMessages((prev) => [
         ...prev,
         { id: `${Date.now()}-saveerr`, role: 'bot', text: `Couldn't save that: ${(err as Error).message}`, timestamp: new Date() },
       ]);
     } finally {
-      setIntentBusy(false);
+      setBusyKey(null);
     }
   };
 
-  const handleRejectIntent = () => {
-    setPendingIntent(null);
+  const handleRejectIntent = (key: string) => {
+    setPendingIntents((prev) => prev.filter((p) => p.key !== key));
     setMessages((prev) => [...prev, { id: `${Date.now()}-rejected`, role: 'bot', text: 'Okay, discarded.', timestamp: new Date() }]);
   };
 
-  const handleEditIntent = async (instruction: string) => {
-    if (!pendingIntent) return;
-    setIntentBusy(true);
+  const handleEditIntent = async (key: string, instruction: string) => {
+    const item = pendingIntents.find((p) => p.key === key);
+    if (!item) return;
+    setBusyKey(key);
     try {
-      const res = await editIntent(pendingIntent, instruction);
-      setPendingIntent(res.intent);
+      // Mini-bot resolves the edit (typos → real accounts, etc.).
+      const edited = await editIntent(item.data, instruction);
+      const corrected = edited.intent;
+      // Reflect the correction on the card right away.
+      setPendingIntents((prev) => prev.map((p) => (p.key === key ? { ...p, data: corrected } : p)));
+
+      // Auto-apply when confident: try to save the corrected intent immediately.
+      const res = await acceptIntent(corrected, warnedKeys.has(key));
+      if (res.executed) {
+        setMessages((prev) => [...prev, { id: `${Date.now()}-saved`, role: 'bot', text: 'Saved.', timestamp: new Date() }]);
+        setPendingIntents((prev) => prev.filter((p) => p.key !== key));
+        setWarnedKeys((prev) => {
+          const next = new Set(prev);
+          next.delete(key);
+          return next;
+        });
+      } else {
+        // Duplicate — keep the corrected card; a tap on Accept forces it through.
+        setMessages((prev) => [
+          ...prev,
+          { id: `${Date.now()}-dup`, role: 'bot', text: `${res.message} Tap Accept to add it anyway.`, timestamp: new Date() },
+        ]);
+        setWarnedKeys((prev) => new Set(prev).add(key));
+      }
     } catch (err) {
+      // Couldn't resolve cleanly (e.g. an account it won't invent) — surface it and leave the card to fix.
       setMessages((prev) => [
         ...prev,
-        { id: `${Date.now()}-editerr`, role: 'bot', text: `Couldn't apply that edit: ${(err as Error).message}`, timestamp: new Date() },
+        { id: `${Date.now()}-editerr`, role: 'bot', text: `Couldn't apply that: ${(err as Error).message}`, timestamp: new Date() },
       ]);
     } finally {
-      setIntentBusy(false);
+      setBusyKey(null);
     }
   };
 
@@ -396,7 +447,11 @@ export default function Chat({ onOpenHistory, onOpenSettings, conversationId, on
                     paddingVertical: 10,
                   }}
                 >
-                  <Text style={{ color: isUser ? colors.background : colors.text }}>{item.text}</Text>
+                  {isUser ? (
+                    <Text style={{ color: colors.background }}>{item.text}</Text>
+                  ) : (
+                    <FormattedMessage text={item.text} color={colors.text} />
+                  )}
                 </View>
                 <Text
                   style={{
@@ -417,7 +472,7 @@ export default function Chat({ onOpenHistory, onOpenSettings, conversationId, on
       </View>
 
       {/* Pending confirmations stack — grows into its own scroll area when there are several */}
-      {(pendingClassifications.length > 0 || pendingIntent) && (
+      {(pendingClassifications.length > 0 || pendingIntents.length > 0) && (
         <ScrollView style={{ maxHeight: 260, marginHorizontal: 16, marginBottom: 8 }} contentContainerStyle={{ paddingBottom: 4 }}>
           {pendingClassifications.map((account) => (
             <ClassifyAccountCard
@@ -426,15 +481,16 @@ export default function Chat({ onOpenHistory, onOpenSettings, conversationId, on
               onSubmit={(groupType, isLiability) => handleClassify(account.id, groupType, isLiability)}
             />
           ))}
-          {pendingIntent && (
+          {pendingIntents.map((item) => (
             <IntentCard
-              intent={pendingIntent}
-              busy={intentBusy}
-              onAccept={handleAcceptIntent}
-              onReject={handleRejectIntent}
-              onEdit={handleEditIntent}
+              key={item.key}
+              intent={item.data}
+              busy={busyKey === item.key}
+              onAccept={() => handleAcceptIntent(item.key)}
+              onReject={() => handleRejectIntent(item.key)}
+              onEdit={(instruction) => handleEditIntent(item.key, instruction)}
             />
-          )}
+          ))}
         </ScrollView>
       )}
 
@@ -463,12 +519,12 @@ export default function Chat({ onOpenHistory, onOpenSettings, conversationId, on
       </ScrollView>
 
       {/* Type box */}
-      <View
+      <Animated.View
         style={{
           backgroundColor: colors.surfaceAlt,
           borderRadius: 24,
           marginHorizontal: 16,
-          marginBottom: insets.bottom + 12,
+          marginBottom: inputMarginBottom,
           paddingHorizontal: 16,
           paddingTop: 12,
           paddingBottom: 8,
@@ -548,7 +604,7 @@ export default function Chat({ onOpenHistory, onOpenSettings, conversationId, on
             </Pressable>
           </View>
         </View>
-      </View>
+      </Animated.View>
     </Animated.View>
   );
 }
