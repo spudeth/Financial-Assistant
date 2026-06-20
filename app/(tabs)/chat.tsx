@@ -31,13 +31,7 @@ const APP_NAME = 'Financial Assistant';
 const USER_NAME = 'Alex';
 const USER_INITIALS = 'A';
 
-type Message = { id: string; role: 'user' | 'bot'; text: string; timestamp: Date };
-
-const QUICK_ACTIONS = [
-  { label: 'Log a coffee', text: 'Log a coffee purchase' },
-  { label: 'Check my balance', text: "What's my balance?" },
-  { label: 'Add an expense', text: 'I want to add an expense' },
-];
+type Message = { id: string; role: 'user' | 'bot'; text: string; timestamp: Date; retryText?: string };
 
 const NIGHT_GREETINGS = ['Up late, {name}?', 'Late-night budgeting?', 'Money on your mind?'];
 const DAY_GREETINGS = [
@@ -260,6 +254,7 @@ export default function Chat({ onOpenHistory, onOpenSettings, conversationId, on
         role: 'bot',
         text: `Something went wrong: ${(err as Error).message}`,
         timestamp: new Date(),
+        retryText: trimmed,
       };
       setMessages((prev) => [...prev, errorMessage]);
     } finally {
@@ -313,27 +308,8 @@ export default function Chat({ onOpenHistory, onOpenSettings, conversationId, on
       // Mini-bot resolves the edit (typos → real accounts, etc.).
       const edited = await editIntent(item.data, instruction);
       const corrected = edited.intent;
-      // Reflect the correction on the card right away.
+      // Reflect the correction on the card; user still has to tap Accept to save it.
       setPendingIntents((prev) => prev.map((p) => (p.key === key ? { ...p, data: corrected } : p)));
-
-      // Auto-apply when confident: try to save the corrected intent immediately.
-      const res = await acceptIntent(corrected, warnedKeys.has(key));
-      if (res.executed) {
-        setMessages((prev) => [...prev, { id: `${Date.now()}-saved`, role: 'bot', text: 'Saved.', timestamp: new Date() }]);
-        setPendingIntents((prev) => prev.filter((p) => p.key !== key));
-        setWarnedKeys((prev) => {
-          const next = new Set(prev);
-          next.delete(key);
-          return next;
-        });
-      } else {
-        // Duplicate — keep the corrected card; a tap on Accept forces it through.
-        setMessages((prev) => [
-          ...prev,
-          { id: `${Date.now()}-dup`, role: 'bot', text: `${res.message} Tap Accept to add it anyway.`, timestamp: new Date() },
-        ]);
-        setWarnedKeys((prev) => new Set(prev).add(key));
-      }
     } catch (err) {
       // Couldn't resolve cleanly (e.g. an account it won't invent) — surface it and leave the card to fix.
       setMessages((prev) => [
@@ -464,6 +440,11 @@ export default function Chat({ onOpenHistory, onOpenSettings, conversationId, on
                 >
                   {formatTime(item.timestamp)}
                 </Text>
+                {item.retryText && (
+                  <Pressable onPress={() => sendMessage(item.retryText!)}>
+                    <Text style={{ color: '#ff4d4d', fontSize: 12, marginTop: 4, alignSelf: 'flex-start' }}>Retry</Text>
+                  </Pressable>
+                )}
               </View>
             );
           }}
@@ -493,30 +474,6 @@ export default function Chat({ onOpenHistory, onOpenSettings, conversationId, on
           ))}
         </ScrollView>
       )}
-
-      {/* Quick action chips */}
-      <ScrollView
-        horizontal
-        showsHorizontalScrollIndicator={false}
-        contentContainerStyle={{ paddingHorizontal: 16, gap: 8 }}
-        style={{ flexGrow: 0, marginBottom: 8 }}
-      >
-        {QUICK_ACTIONS.map((action) => (
-          <Pressable
-            key={action.label}
-            onPress={() => sendMessage(action.text)}
-            style={{
-              backgroundColor: colors.surfaceAlt,
-              borderRadius: 999,
-              paddingHorizontal: 14,
-              paddingVertical: 8,
-              marginRight: 8,
-            }}
-          >
-            <Text style={{ color: colors.text, fontSize: 13 }}>{action.label}</Text>
-          </Pressable>
-        ))}
-      </ScrollView>
 
       {/* Type box */}
       <Animated.View

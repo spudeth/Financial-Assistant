@@ -29,3 +29,11 @@
 8. From then on, run `npx expo start --dev-client` instead of `npx expo start`, and open the custom installed app instead of ExpoGo
 9. Re-install `react-native-keyboard-controller` and swap it back into `chat.tsx` if still wanted (the JS-only workaround can stay too — both work)
 10. Later, for App Store: `npx eas build --profile production --platform ios` then `npx eas submit -p ios`
+
+## Edge function errors don't say which function (or which failure case) caused them
+
+**Issue:** There are 4 Supabase Edge Functions (small backend scripts: `chat`, `csv-import`, `confirm`, `delete-account`). When one of them fails, the error that comes back is just a generic message — there's no code identifying which function failed or which specific check inside it failed.
+
+**Why it's a problem:** Makes debugging slower — have to guess or dig through logs to figure out which function broke and why.
+
+**Solution:** Give each edge function its own short error code prefix (e.g. `CHAT-`, `CSV-`, `CONFIRM-`, `DEL-`), number each distinct failure point inside a function (e.g. `CHAT-001` = "not authenticated"), and include that code in the error response. Keep a local `.txt` file as a lookup table mapping codes → what they mean, and update it any time a new error path is added.

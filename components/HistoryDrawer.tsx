@@ -1,9 +1,79 @@
 import { useCallback, useEffect, useState } from 'react';
-import { FlatList, Pressable, Text, TextInput, View } from 'react-native';
+import { Alert, FlatList, Pressable, Text, TextInput, View } from 'react-native';
+import { Gesture, GestureDetector } from 'react-native-gesture-handler';
+import Animated, { Easing, useAnimatedStyle, useSharedValue, withTiming } from 'react-native-reanimated';
 import { colors, spacing, radius } from '../theme/theme';
 import { supabase } from '../lib/supabase';
+import TrashIcon from './TrashIcon';
 
 type Thread = { id: string; title: string; timestamp: string };
+
+const SWIPE_OPEN_WIDTH = 72;
+const SWIPE_TRIGGER = 40;
+
+function ThreadRow({
+  thread,
+  onPress,
+  onDelete,
+}: {
+  thread: Thread;
+  onPress: () => void;
+  onDelete: () => void;
+}) {
+  const translateX = useSharedValue(0);
+  const openOffset = useSharedValue(0);
+
+  const pan = Gesture.Pan()
+    .activeOffsetX([-10, 10])
+    .failOffsetY([-10, 10])
+    .onUpdate((e) => {
+      translateX.value = Math.max(0, Math.min(SWIPE_OPEN_WIDTH, openOffset.value + e.translationX));
+    })
+    .onEnd((e) => {
+      const dragged = Math.max(0, Math.min(SWIPE_OPEN_WIDTH, openOffset.value + e.translationX));
+      const isQuickFlick = e.velocityX > 400 && e.translationX > 0;
+      const open = dragged > SWIPE_TRIGGER || isQuickFlick;
+      openOffset.value = open ? SWIPE_OPEN_WIDTH : 0;
+      translateX.value = withTiming(openOffset.value, { duration: 220, easing: Easing.out(Easing.cubic) });
+    });
+
+  const rowStyle = useAnimatedStyle(() => ({
+    transform: [{ translateX: translateX.value }],
+  }));
+
+  return (
+    <View style={{ borderBottomWidth: 1, borderBottomColor: 'rgba(255,255,255,0.06)' }}>
+      <View
+        style={{
+          position: 'absolute',
+          left: 0,
+          top: 0,
+          bottom: 0,
+          width: SWIPE_OPEN_WIDTH,
+          alignItems: 'center',
+          justifyContent: 'center',
+        }}
+      >
+        <Pressable
+          onPress={onDelete}
+          style={{ width: '100%', height: '100%', alignItems: 'center', justifyContent: 'center' }}
+        >
+          <TrashIcon size={20} opacity={0.5} />
+        </Pressable>
+      </View>
+      <GestureDetector gesture={pan}>
+        <Animated.View style={[{ backgroundColor: colors.background }, rowStyle]}>
+          <Pressable onPress={onPress} style={{ paddingVertical: spacing.sm }}>
+            <Text style={{ color: colors.text, fontWeight: '700' }} numberOfLines={2}>
+              {thread.title}
+            </Text>
+            <Text style={{ color: colors.textMuted, fontSize: 11, marginTop: 2, opacity: 0.7 }}>{thread.timestamp}</Text>
+          </Pressable>
+        </Animated.View>
+      </GestureDetector>
+    </View>
+  );
+}
 
 function formatRelative(iso: string): string {
   const diffMs = Date.now() - new Date(iso).getTime();
@@ -43,6 +113,24 @@ export default function HistoryDrawer({ onClose, onOpenSettings, onSelectConvers
   useEffect(() => {
     load();
   }, [load]);
+
+  const deleteThread = useCallback((id: string) => {
+    Alert.alert('Delete conversation?', 'This cannot be undone.', [
+      { text: 'Cancel', style: 'cancel' },
+      {
+        text: 'Delete',
+        style: 'destructive',
+        onPress: async () => {
+          const { error } = await supabase.from('conversations').delete().eq('id', id);
+          if (error) {
+            Alert.alert('Error', error.message);
+            return;
+          }
+          setThreads((prev) => prev.filter((t) => t.id !== id));
+        },
+      },
+    ]);
+  }, []);
 
   const filtered = threads.filter((t) => t.title.toLowerCase().includes(query.toLowerCase()));
 
@@ -123,19 +211,11 @@ export default function HistoryDrawer({ onClose, onOpenSettings, onSelectConvers
           </Text>
         }
         renderItem={({ item }) => (
-          <Pressable
+          <ThreadRow
+            thread={item}
             onPress={() => onSelectConversation(item.id)}
-            style={{
-              paddingVertical: spacing.sm,
-              borderBottomWidth: 1,
-              borderBottomColor: 'rgba(255,255,255,0.06)',
-            }}
-          >
-            <Text style={{ color: colors.text, fontWeight: '700' }} numberOfLines={2}>
-              {item.title}
-            </Text>
-            <Text style={{ color: colors.textMuted, fontSize: 11, marginTop: 2, opacity: 0.7 }}>{item.timestamp}</Text>
-          </Pressable>
+            onDelete={() => deleteThread(item.id)}
+          />
         )}
       />
 

@@ -1,10 +1,10 @@
 // Shared find-or-create helpers. Accounts and categories are derivative of
-// the ledger now — nothing is pre-seeded. CSV import uses both of these
-// freely (that's how a derivative-accounts world gets bootstrapped from
-// real data). Chat-driven writes only use findOrCreateCategory — accounts
-// are never silently invented from chat; writeRegistry.ts's lookupAccountId
-// stays find-or-throw so an unrecognized account name surfaces as a
-// clarifying question instead of a guess.
+// the ledger now — nothing is pre-seeded. CSV import and chat-driven writes
+// both use findOrCreateAccount/findOrCreateCategory freely — a guessed
+// account/category is fine because nothing commits until the user approves
+// the confirm card. writeRegistry.ts's lookupAccountId is still used for
+// patching an existing record's account (edit_recurring/edit_transaction),
+// where find-or-throw is the safer default.
 
 import type { SupabaseClient } from 'npm:@supabase/supabase-js@2';
 import { categoryNameParts } from './vocab.ts';

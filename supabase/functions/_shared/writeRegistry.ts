@@ -5,16 +5,16 @@
 // ids, writes one row, and appends an audit_log entry (ported from v1's
 // appendLog pattern).
 //
-// Accounts/categories are derivative — nothing is pre-seeded. Categories
-// auto-create passively here (findOrCreateCategory) since a sloppy/rough
-// category is fine, the user can rename/edit later. Accounts do NOT
-// auto-create from chat — lookupAccountId stays find-or-throw, so an
-// unrecognized account name surfaces as an error rather than inventing a
-// new account from a hallucinated or misheard name. CSV import is the only
-// place accounts get created on the fly (see ledger.ts / csv-import).
+// Accounts/categories are derivative — nothing is pre-seeded. Both
+// auto-create passively here (findOrCreateAccount/findOrCreateCategory): a
+// sloppy/rough name is fine, the user can rename/edit later, and nothing
+// commits without the user approving the confirm card first. The remaining
+// edit_recurring/edit_transaction account-patch fields still use
+// lookupAccountId (find-or-throw) — patching an existing record to a
+// typo'd account name is treated differently than logging new money.
 
 import type { SupabaseClient } from 'npm:@supabase/supabase-js@2';
-import { exact, findOrCreateCategory } from './ledger.ts';
+import { exact, findOrCreateAccount, findOrCreateCategory } from './ledger.ts';
 import { categoryNameParts } from './vocab.ts';
 
 function parseAmount(value: unknown): number {
@@ -93,7 +93,7 @@ async function addExpenseOrIncome(
   const account = requireString(input.account, 'account');
 
   const amount = parseAmount(input.amount);
-  const account_id = await lookupAccountId(supabase, account);
+  const account_id = await findOrCreateAccount(supabase, userId, account);
   const category_id = await findOrCreateCategory(supabase, userId, category, type);
   const occurred_on = (input.date as string) || todayIso();
 
@@ -127,8 +127,8 @@ export const writeRegistry: Record<string, WriteHandler> = {
     if (fromAccount === toAccount) throw new Error('from_account and to_account must be different');
 
     const amount = parseAmount(input.amount);
-    const account_id = await lookupAccountId(supabase, fromAccount);
-    const counterparty_account_id = await lookupAccountId(supabase, toAccount);
+    const account_id = await findOrCreateAccount(supabase, userId, fromAccount);
+    const counterparty_account_id = await findOrCreateAccount(supabase, userId, toAccount);
     const occurred_on = (input.date as string) || todayIso();
 
     const { data, error } = await supabase
@@ -161,7 +161,7 @@ export const writeRegistry: Record<string, WriteHandler> = {
     }
 
     const amount = parseAmount(input.amount);
-    const account_id = await lookupAccountId(supabase, account);
+    const account_id = await findOrCreateAccount(supabase, userId, account);
     const category_id = await findOrCreateCategory(supabase, userId, category, type);
     const next_on = requireString(input.start, 'start');
 
@@ -360,7 +360,7 @@ export const writeRegistry: Record<string, WriteHandler> = {
     }
     const targetBalance = Math.round(rawTarget * 100) / 100;
 
-    const account_id = await lookupAccountId(supabase, account);
+    const account_id = await findOrCreateAccount(supabase, userId, account);
     const currentBalance = await getAccountBalance(supabase, account_id);
     const delta = Math.round((targetBalance - currentBalance) * 100) / 100;
 
