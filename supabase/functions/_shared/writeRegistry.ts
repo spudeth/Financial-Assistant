@@ -1,17 +1,15 @@
-// Write function registry. Claude never calls these directly — it only
-// fills out the matching intent object (the chat function returns that
-// object, unexecuted, to the client). These handlers are invoked ONLY by
-// the confirm function, after the user accepts. Each one resolves names to
-// ids, writes one row, and appends an audit_log entry (ported from v1's
-// appendLog pattern).
+// Write function registry. Claude never calls these directly — it only fills
+// out the matching intent object (chat returns it, unexecuted, to the client).
+// These handlers run ONLY from the confirm function, after the user accepts.
 //
-// Accounts/categories are derivative — nothing is pre-seeded. Both
-// auto-create passively here (findOrCreateAccount/findOrCreateCategory): a
-// sloppy/rough name is fine, the user can rename/edit later, and nothing
-// commits without the user approving the confirm card first. The remaining
-// edit_recurring/edit_transaction account-patch fields still use
-// lookupAccountId (find-or-throw) — patching an existing record to a
-// typo'd account name is treated differently than logging new money.
+// The create surface is a single tool: add_transaction. Everything is pure
+// double-entry — money moves FROM one account TO another — and the kind
+// (income/expense/transfer) is derived from which side is the user's own
+// account (is_external = false), never stored. Accounts and categories
+// auto-create (findOrCreateAccount/findOrCreateCategory) — a rough name is
+// fine, the confirm card lets the user fix it, and nothing commits until they
+// approve. The remaining edit handlers also find-or-create on account/category
+// patches rather than throwing on a new name.
 
 import type { SupabaseClient } from 'npm:@supabase/supabase-js@2';
 import { exact, findOrCreateAccount, findOrCreateCategory } from './ledger.ts';
@@ -34,10 +32,18 @@ function todayIso(): string {
   return new Date().toISOString().slice(0, 10);
 }
 
-async function lookupAccountId(supabase: SupabaseClient, name: string): Promise<string> {
-  const { data, error } = await supabase.from('accounts').select('id').ilike('name', exact(name)).single();
-  if (error || !data) throw new Error(`Account "${name}" does not exist`);
-  return data.id;
+// Given the two account ids of a transaction, derive whether it reads as
+// income, expense, or transfer (for filing an optional category under the
+// right income/expense vocab). Transfers (both personal) carry no category.
+async function deriveKind(
+  supabase: SupabaseClient,
+  fromId: string,
+  toId: string,
+): Promise<'income' | 'expense' | null> {
+  const { data: sides } = await supabase.from('accounts').select('id, is_external').in('id', [fromId, toId]);
+  const fromExt = sides?.find((s: { id: string; is_external: boolean }) => s.id === fromId)?.is_external ?? true;
+  const toExt = sides?.find((s: { id: string; is_external: boolean }) => s.id === toId)?.is_external ?? true;
+  return fromExt && !toExt ? 'income' : !fromExt && toExt ? 'expense' : null;
 }
 
 // Budgets must target a category that already exists — find-or-throw, never create.
@@ -52,14 +58,6 @@ async function lookupCategoryId(supabase: SupabaseClient, categoryPath: string, 
     .from('categories').select('id').ilike('name', exact(child)).eq('kind', kind).eq('parent_id', parentRow.id).single();
   if (childErr || !childRow) throw new Error(`Subcategory "${categoryPath}" does not exist`);
   return childRow.id;
-}
-
-async function getAccountBalance(supabase: SupabaseClient, accountId: string): Promise<number> {
-  const { data: acct, error } = await supabase.from('accounts').select('starting_balance').eq('id', accountId).single();
-  if (error || !acct) throw new Error('Could not load account');
-  const { data: postings } = await supabase.from('postings').select('delta').eq('account_id', accountId);
-  const total = (postings ?? []).reduce((sum: number, p: { delta: number }) => sum + Number(p.delta), 0);
-  return Number(acct.starting_balance) + total;
 }
 
 async function appendAudit(
@@ -83,156 +81,95 @@ async function appendAudit(
 
 type WriteHandler = (supabase: SupabaseClient, userId: string, input: Record<string, unknown>) => Promise<unknown>;
 
-async function addExpenseOrIncome(
-  supabase: SupabaseClient,
-  userId: string,
-  input: Record<string, unknown>,
-  type: 'expense' | 'income'
-) {
-  const category = requireString(input.category, 'category');
-  const account = requireString(input.account, 'account');
-
-  const amount = parseAmount(input.amount);
-  const account_id = await findOrCreateAccount(supabase, userId, account);
-  const category_id = await findOrCreateCategory(supabase, userId, category, type);
-  const occurred_on = (input.date as string) || todayIso();
-
-  const { data, error } = await supabase
-    .from('transactions')
-    .insert({
-      user_id: userId,
-      occurred_on,
-      type,
-      amount,
-      account_id,
-      category_id,
-      payee: input.payee ?? null,
-      note: input.note ?? null,
-    })
-    .select()
-    .single();
-  if (error) throw new Error(error.message);
-
-  await appendAudit(supabase, userId, `add_${type}`, 'transactions', data.id, null, data);
-  return data;
-}
-
 export const writeRegistry: Record<string, WriteHandler> = {
-  add_expense: (supabase, userId, input) => addExpenseOrIncome(supabase, userId, input, 'expense'),
-  add_income: (supabase, userId, input) => addExpenseOrIncome(supabase, userId, input, 'income'),
-
-  add_transfer: async (supabase, userId, input) => {
+  // The one canonical create tool. from_account -> to_account, amount, plus
+  // optional category/date/note and optional recurring schedule. from_external
+  // / to_external are optional booleans the confirm card sends when the user
+  // corrects the bot's personal-vs-external read of an account.
+  add_transaction: async (supabase, userId, input) => {
     const fromAccount = requireString(input.from_account, 'from_account');
     const toAccount = requireString(input.to_account, 'to_account');
-    if (fromAccount === toAccount) throw new Error('from_account and to_account must be different');
-
+    if (fromAccount.toLowerCase() === toAccount.toLowerCase()) {
+      throw new Error('from_account and to_account must be different');
+    }
     const amount = parseAmount(input.amount);
-    const account_id = await findOrCreateAccount(supabase, userId, fromAccount);
-    const counterparty_account_id = await findOrCreateAccount(supabase, userId, toAccount);
-    const occurred_on = (input.date as string) || todayIso();
+    const from_account_id = await findOrCreateAccount(supabase, userId, fromAccount);
+    const to_account_id = await findOrCreateAccount(supabase, userId, toAccount);
 
+    // Apply the user's personal/external corrections from the card (if any),
+    // so the derived kind and future reports reflect them.
+    if (typeof input.from_external === 'boolean') {
+      await supabase.from('accounts').update({ is_external: input.from_external }).eq('id', from_account_id);
+    }
+    if (typeof input.to_external === 'boolean') {
+      await supabase.from('accounts').update({ is_external: input.to_external }).eq('id', to_account_id);
+    }
+
+    // Safety net: a transaction with NO personal side is invisible in every
+    // report (neither income, expense, nor a balance change). If neither side is
+    // personal, treat the source as the user's account — the common "spent from
+    // my account" case. The confirm card's Personal/External toggle lets the
+    // user correct it.
+    {
+      const { data: chk } = await supabase.from('accounts').select('id, is_external').in('id', [from_account_id, to_account_id]);
+      const fE = chk?.find((a: { id: string; is_external: boolean }) => a.id === from_account_id)?.is_external ?? true;
+      const tE = chk?.find((a: { id: string; is_external: boolean }) => a.id === to_account_id)?.is_external ?? true;
+      if (fE && tE) await supabase.from('accounts').update({ is_external: false }).eq('id', from_account_id);
+    }
+
+    const kind = await deriveKind(supabase, from_account_id, to_account_id);
+    let category_id: string | null = null;
+    if (kind && input.category && String(input.category).trim()) {
+      category_id = await findOrCreateCategory(supabase, userId, String(input.category), kind);
+    }
+
+    // recurring => a repeating schedule (future rows generated when due);
+    // otherwise a single transaction now.
+    if (input.recurring) {
+      const frequency = requireString(input.frequency, 'frequency');
+      if (!['weekly', 'biweekly', 'monthly', 'yearly'].includes(frequency)) {
+        throw new Error(`"${frequency}" is not a recognized frequency`);
+      }
+      const next_on = requireString(input.start, 'start');
+      const { data, error } = await supabase
+        .from('recurrences')
+        .insert({
+          user_id: userId,
+          from_account_id,
+          to_account_id,
+          amount,
+          category_id,
+          note: input.note ?? null,
+          frequency,
+          next_on,
+          end_on: input.end ?? null,
+        })
+        .select()
+        .single();
+      if (error) throw new Error(error.message);
+      await appendAudit(supabase, userId, 'add_recurring', 'recurrences', data.id, null, data);
+      // Materialize the next 365 days of this recurrence as actual transaction rows.
+      await supabase.rpc('generate_recurring_transactions', { p_recurrence_id: data.id });
+      return data;
+    }
+
+    const occurred_on = (input.date as string) || todayIso();
     const { data, error } = await supabase
       .from('transactions')
       .insert({
         user_id: userId,
         occurred_on,
-        type: 'transfer',
+        from_account_id,
+        to_account_id,
         amount,
-        account_id,
-        counterparty_account_id,
+        category_id,
         note: input.note ?? null,
       })
       .select()
       .single();
     if (error) throw new Error(error.message);
-
-    await appendAudit(supabase, userId, 'add_transfer', 'transactions', data.id, null, data);
+    await appendAudit(supabase, userId, 'add_transaction', 'transactions', data.id, null, data);
     return data;
-  },
-
-  add_recurring: async (supabase, userId, input) => {
-    const type = requireString(input.type, 'type') as 'income' | 'expense';
-    if (type !== 'income' && type !== 'expense') throw new Error('type must be "income" or "expense"');
-    const category = requireString(input.category, 'category');
-    const account = requireString(input.account, 'account');
-    const frequency = requireString(input.frequency, 'frequency');
-    if (!['weekly', 'biweekly', 'monthly', 'yearly'].includes(frequency)) {
-      throw new Error(`"${frequency}" is not a recognized frequency`);
-    }
-
-    const amount = parseAmount(input.amount);
-    const account_id = await findOrCreateAccount(supabase, userId, account);
-    const category_id = await findOrCreateCategory(supabase, userId, category, type);
-    const next_on = requireString(input.start, 'start');
-
-    const { data, error } = await supabase
-      .from('recurrences')
-      .insert({
-        user_id: userId,
-        type,
-        amount,
-        account_id,
-        category_id,
-        payee: input.payee ?? null,
-        frequency,
-        next_on,
-        end_on: input.end ?? null,
-        mode: 'repeat',
-      })
-      .select()
-      .single();
-    if (error) throw new Error(error.message);
-
-    await appendAudit(supabase, userId, 'add_recurring', 'recurrences', data.id, null, data);
-    return data;
-  },
-
-  edit_recurring: async (supabase, userId, input) => {
-    const id = requireString(input.id, 'id');
-    const patch = (input.patch as Record<string, unknown>) ?? {};
-
-    const { data: existing, error: fetchErr } = await supabase.from('recurrences').select('*').eq('id', id).single();
-    if (fetchErr || !existing) throw new Error(`Recurring item "${id}" not found`);
-
-    const update: Record<string, unknown> = {};
-    if (patch.amount !== undefined) update.amount = parseAmount(patch.amount);
-    if (patch.payee !== undefined) update.payee = patch.payee;
-    if (patch.note !== undefined) update.note = patch.note;
-    if (patch.next_on !== undefined) update.next_on = patch.next_on;
-    if (patch.end_on !== undefined) update.end_on = patch.end_on;
-    if (patch.frequency !== undefined) {
-      const frequency = requireString(patch.frequency, 'frequency');
-      if (!['weekly', 'biweekly', 'monthly', 'yearly'].includes(frequency)) throw new Error(`"${frequency}" is not a recognized frequency`);
-      update.frequency = frequency;
-    }
-    if (patch.account !== undefined) {
-      update.account_id = await lookupAccountId(supabase, requireString(patch.account, 'account'));
-    }
-    if (patch.category !== undefined) {
-      const category = requireString(patch.category, 'category');
-      update.category_id = await findOrCreateCategory(supabase, userId, category, existing.type === 'income' ? 'income' : 'expense');
-    }
-
-    const { data, error } = await supabase.from('recurrences').update(update).eq('id', id).select().single();
-    if (error) throw new Error(error.message);
-
-    await appendAudit(supabase, userId, 'edit_recurring', 'recurrences', id, existing, data);
-    return data;
-  },
-
-  // Cancel a recurring item (active = false) rather than hard-delete: it stops
-  // generating, drops out of the active list, and past rows that referenced it
-  // stay intact.
-  delete_recurring: async (supabase, userId, input) => {
-    const id = requireString(input.id, 'id');
-    const { data: existing, error: fetchErr } = await supabase.from('recurrences').select('*').eq('id', id).single();
-    if (fetchErr || !existing) throw new Error(`Recurring item "${id}" not found`);
-
-    const { data, error } = await supabase.from('recurrences').update({ active: false }).eq('id', id).select().single();
-    if (error) throw new Error(error.message);
-
-    await appendAudit(supabase, userId, 'delete_recurring', 'recurrences', id, existing, data);
-    return { cancelled: true, id };
   },
 
   edit_transaction: async (supabase, userId, input) => {
@@ -245,14 +182,18 @@ export const writeRegistry: Record<string, WriteHandler> = {
     const update: Record<string, unknown> = {};
     if (patch.amount !== undefined) update.amount = parseAmount(patch.amount);
     if (patch.date !== undefined) update.occurred_on = patch.date;
-    if (patch.payee !== undefined) update.payee = patch.payee;
     if (patch.note !== undefined) update.note = patch.note;
-    if (patch.account !== undefined) {
-      update.account_id = await lookupAccountId(supabase, requireString(patch.account, 'account'));
+    if (patch.from_account !== undefined) {
+      update.from_account_id = await findOrCreateAccount(supabase, userId, requireString(patch.from_account, 'from_account'));
+    }
+    if (patch.to_account !== undefined) {
+      update.to_account_id = await findOrCreateAccount(supabase, userId, requireString(patch.to_account, 'to_account'));
     }
     if (patch.category !== undefined) {
-      const category = requireString(patch.category, 'category');
-      update.category_id = await findOrCreateCategory(supabase, userId, category, existing.type === 'income' ? 'income' : 'expense');
+      const fromId = (update.from_account_id as string) ?? existing.from_account_id;
+      const toId = (update.to_account_id as string) ?? existing.to_account_id;
+      const kind = await deriveKind(supabase, fromId, toId);
+      update.category_id = kind ? await findOrCreateCategory(supabase, userId, requireString(patch.category, 'category'), kind) : null;
     }
 
     const { data, error } = await supabase.from('transactions').update(update).eq('id', id).select().single();
@@ -272,6 +213,62 @@ export const writeRegistry: Record<string, WriteHandler> = {
 
     await appendAudit(supabase, userId, 'delete_transaction', 'transactions', id, existing, null);
     return { deleted: true, id };
+  },
+
+  edit_recurring: async (supabase, userId, input) => {
+    const id = requireString(input.id, 'id');
+    const patch = (input.patch as Record<string, unknown>) ?? {};
+
+    const { data: existing, error: fetchErr } = await supabase.from('recurrences').select('*').eq('id', id).single();
+    if (fetchErr || !existing) throw new Error(`Recurring item "${id}" not found`);
+
+    const update: Record<string, unknown> = {};
+    if (patch.amount !== undefined) update.amount = parseAmount(patch.amount);
+    if (patch.note !== undefined) update.note = patch.note;
+    if (patch.next_on !== undefined) update.next_on = patch.next_on;
+    if (patch.end_on !== undefined) update.end_on = patch.end_on;
+    if (patch.frequency !== undefined) {
+      const frequency = requireString(patch.frequency, 'frequency');
+      if (!['weekly', 'biweekly', 'monthly', 'yearly'].includes(frequency)) throw new Error(`"${frequency}" is not a recognized frequency`);
+      update.frequency = frequency;
+    }
+    if (patch.from_account !== undefined) {
+      update.from_account_id = await findOrCreateAccount(supabase, userId, requireString(patch.from_account, 'from_account'));
+    }
+    if (patch.to_account !== undefined) {
+      update.to_account_id = await findOrCreateAccount(supabase, userId, requireString(patch.to_account, 'to_account'));
+    }
+    if (patch.category !== undefined) {
+      const fromId = (update.from_account_id as string) ?? existing.from_account_id;
+      const toId = (update.to_account_id as string) ?? existing.to_account_id;
+      const kind = await deriveKind(supabase, fromId, toId);
+      update.category_id = kind ? await findOrCreateCategory(supabase, userId, requireString(patch.category, 'category'), kind) : null;
+    }
+
+    const { data, error } = await supabase.from('recurrences').update(update).eq('id', id).select().single();
+    if (error) throw new Error(error.message);
+
+    await appendAudit(supabase, userId, 'edit_recurring', 'recurrences', id, existing, data);
+    // Regenerate all future occurrences with the new schedule terms.
+    await supabase.rpc('generate_recurring_transactions', { p_recurrence_id: id });
+    return data;
+  },
+
+  // Cancel a recurring item (active = false) rather than hard-delete: it stops
+  // generating, drops out of the active list, and past rows that referenced it
+  // stay intact.
+  delete_recurring: async (supabase, userId, input) => {
+    const id = requireString(input.id, 'id');
+    const { data: existing, error: fetchErr } = await supabase.from('recurrences').select('*').eq('id', id).single();
+    if (fetchErr || !existing) throw new Error(`Recurring item "${id}" not found`);
+
+    const { data, error } = await supabase.from('recurrences').update({ active: false }).eq('id', id).select().single();
+    if (error) throw new Error(error.message);
+
+    await appendAudit(supabase, userId, 'delete_recurring', 'recurrences', id, existing, data);
+    // Delete all future occurrences that were generated from this recurrence.
+    await supabase.rpc('generate_recurring_transactions', { p_recurrence_id: id });
+    return { cancelled: true, id };
   },
 
   rename_category: async (supabase, userId, input) => {
@@ -348,12 +345,12 @@ export const writeRegistry: Record<string, WriteHandler> = {
     return { deleted: true, id };
   },
 
+  // Set an account's balance to a stated amount by posting the difference as a
+  // transaction against an external "Balance Adjustment" account. Used by the
+  // Settings reconciliation UI — intentionally NOT in writeToolDefs, so Claude's
+  // create surface stays the single add_transaction tool.
   adjust_balance: async (supabase, userId, input) => {
     const account = requireString(input.account, 'account');
-    const treatAs = requireString(input.treat_as, 'treat_as') as 'adjustment' | 'expense' | 'income';
-    if (!['adjustment', 'expense', 'income'].includes(treatAs)) {
-      throw new Error('treat_as must be "adjustment", "expense", or "income"');
-    }
     const rawTarget = typeof input.target_balance === 'string' ? Number(input.target_balance) : input.target_balance;
     if (typeof rawTarget !== 'number' || !Number.isFinite(rawTarget)) {
       throw new Error(`target_balance must be a number, got: ${JSON.stringify(input.target_balance)}`);
@@ -361,33 +358,30 @@ export const writeRegistry: Record<string, WriteHandler> = {
     const targetBalance = Math.round(rawTarget * 100) / 100;
 
     const account_id = await findOrCreateAccount(supabase, userId, account);
-    const currentBalance = await getAccountBalance(supabase, account_id);
-    const delta = Math.round((targetBalance - currentBalance) * 100) / 100;
-
+    const { data: acct } = await supabase.from('accounts').select('starting_balance').eq('id', account_id).single();
+    const { data: postings } = await supabase.from('postings').select('delta').eq('account_id', account_id);
+    const current = Number(acct?.starting_balance ?? 0) +
+      (postings ?? []).reduce((sum: number, p: { delta: number }) => sum + Number(p.delta), 0);
+    const delta = Math.round((targetBalance - current) * 100) / 100;
     if (delta === 0) return { adjusted: false, message: 'Balance already matches — nothing to do.' };
 
-    if (treatAs === 'income' && delta <= 0) {
-      throw new Error('Target balance is lower than the current balance — that would be an expense or adjustment, not income.');
-    }
-    if (treatAs === 'expense' && delta >= 0) {
-      throw new Error('Target balance is higher than the current balance — that would be income or an adjustment, not an expense.');
-    }
+    const adjustId = await findOrCreateAccount(supabase, userId, 'Balance Adjustment');
+    await supabase.from('accounts').update({ is_external: true }).eq('id', adjustId);
 
-    let category_id: string | null = null;
-    if (treatAs !== 'adjustment') {
-      const category = requireString(input.category, 'category');
-      category_id = await findOrCreateCategory(supabase, userId, category, treatAs);
-    }
+    // delta > 0 (need more) => money in: Adjustment -> account.
+    // delta < 0 (too much)  => money out: account -> Adjustment.
+    const from_account_id = delta > 0 ? adjustId : account_id;
+    const to_account_id = delta > 0 ? account_id : adjustId;
 
     const { data, error } = await supabase
       .from('transactions')
       .insert({
         user_id: userId,
         occurred_on: todayIso(),
-        type: treatAs,
-        amount: treatAs === 'adjustment' ? delta : Math.abs(delta),
-        account_id,
-        category_id,
+        from_account_id,
+        to_account_id,
+        amount: Math.abs(delta),
+        category_id: null,
         note: (input.note as string) ?? 'Balance correction',
       })
       .select()
@@ -402,105 +396,33 @@ export const writeRegistry: Record<string, WriteHandler> = {
 export function writeToolDefs() {
   return [
     {
-      name: 'add_expense',
-      description: 'Log an expense.',
+      name: 'add_transaction',
+      description:
+        'Record money moving between two accounts (double-entry). Every transaction is FROM one account TO another. ' +
+        "A purchase is from the user's own account (cash/card/bank) TO a merchant. Income is from an employer/source TO the user's account. " +
+        "A transfer is between two of the user's own accounts. Whether it counts as income, expense, or transfer is figured out automatically from the accounts — you don't choose a type. " +
+        'Accounts and categories are created automatically if new, so a confident guess is fine. ' +
+        'Set recurring=true (with frequency and start) to set up a repeating bill/income instead of a one-time entry.',
       input_schema: {
         type: 'object',
         properties: {
+          from_account: { type: 'string', description: 'Where the money comes FROM (e.g. "Chase", "cash", or an employer/merchant)' },
+          to_account: { type: 'string', description: 'Where the money goes TO (e.g. a merchant like "Trader Joe\'s", or the user\'s own account)' },
           amount: { type: 'number' },
-          category: { type: 'string' },
-          account: { type: 'string' },
-          payee: { type: 'string' },
+          category: { type: 'string', description: 'Optional. Only meaningful for spending/income, e.g. "Food/Drinks".' },
           date: { type: 'string', description: 'YYYY-MM-DD, defaults to today' },
           note: { type: 'string' },
+          recurring: { type: 'boolean', description: 'true to set up a repeating schedule instead of a one-time transaction' },
+          frequency: { type: 'string', enum: ['weekly', 'biweekly', 'monthly', 'yearly'], description: 'Required if recurring' },
+          start: { type: 'string', description: 'YYYY-MM-DD, the next occurrence date. Required if recurring.' },
+          end: { type: 'string', description: 'YYYY-MM-DD, optional end date for a recurring schedule' },
         },
-        required: ['amount', 'category', 'account'],
-      },
-    },
-    {
-      name: 'add_income',
-      description: 'Log income.',
-      input_schema: {
-        type: 'object',
-        properties: {
-          amount: { type: 'number' },
-          category: { type: 'string' },
-          account: { type: 'string' },
-          payee: { type: 'string' },
-          date: { type: 'string', description: 'YYYY-MM-DD, defaults to today' },
-          note: { type: 'string' },
-        },
-        required: ['amount', 'category', 'account'],
-      },
-    },
-    {
-      name: 'add_transfer',
-      description: 'Move money between two of the user\'s own accounts.',
-      input_schema: {
-        type: 'object',
-        properties: {
-          amount: { type: 'number' },
-          from_account: { type: 'string' },
-          to_account: { type: 'string' },
-          date: { type: 'string', description: 'YYYY-MM-DD, defaults to today' },
-          note: { type: 'string' },
-        },
-        required: ['amount', 'from_account', 'to_account'],
-      },
-    },
-    {
-      name: 'add_recurring',
-      description: 'Set up a recurring income or expense.',
-      input_schema: {
-        type: 'object',
-        properties: {
-          type: { type: 'string', enum: ['income', 'expense'] },
-          amount: { type: 'number' },
-          category: { type: 'string' },
-          account: { type: 'string' },
-          payee: { type: 'string' },
-          frequency: { type: 'string', enum: ['weekly', 'biweekly', 'monthly', 'yearly'] },
-          start: { type: 'string', description: 'YYYY-MM-DD' },
-          end: { type: 'string', description: 'YYYY-MM-DD, optional' },
-        },
-        required: ['type', 'amount', 'category', 'account', 'frequency', 'start'],
-      },
-    },
-    {
-      name: 'edit_recurring',
-      description: 'Change an existing recurring item — a bill or repeating income whose amount, date, frequency, account, or category changed. Look it up first with recurring_transactions to get its id.',
-      input_schema: {
-        type: 'object',
-        properties: {
-          id: { type: 'string' },
-          patch: {
-            type: 'object',
-            properties: {
-              amount: { type: 'number' },
-              category: { type: 'string' },
-              account: { type: 'string' },
-              payee: { type: 'string' },
-              frequency: { type: 'string', enum: ['weekly', 'biweekly', 'monthly', 'yearly'] },
-              next_on: { type: 'string', description: 'YYYY-MM-DD, the next date it hits' },
-              end_on: { type: 'string', description: 'YYYY-MM-DD, optional' },
-            },
-          },
-        },
-        required: ['id', 'patch'],
-      },
-    },
-    {
-      name: 'delete_recurring',
-      description: 'Cancel a recurring item (e.g. a subscription the user stopped). Look it up first with recurring_transactions to get its id.',
-      input_schema: {
-        type: 'object',
-        properties: { id: { type: 'string' } },
-        required: ['id'],
+        required: ['from_account', 'to_account', 'amount'],
       },
     },
     {
       name: 'edit_transaction',
-      description: 'Edit an existing transaction.',
+      description: 'Edit an existing transaction. Look it up first to get its id.',
       input_schema: {
         type: 'object',
         properties: {
@@ -509,10 +431,10 @@ export function writeToolDefs() {
             type: 'object',
             properties: {
               amount: { type: 'number' },
+              from_account: { type: 'string' },
+              to_account: { type: 'string' },
               category: { type: 'string' },
-              account: { type: 'string' },
-              payee: { type: 'string' },
-              date: { type: 'string' },
+              date: { type: 'string', description: 'YYYY-MM-DD' },
               note: { type: 'string' },
             },
           },
@@ -522,7 +444,40 @@ export function writeToolDefs() {
     },
     {
       name: 'delete_transaction',
-      description: 'Delete an existing transaction.',
+      description: 'Delete an existing transaction. Look it up first to get its id.',
+      input_schema: {
+        type: 'object',
+        properties: { id: { type: 'string' } },
+        required: ['id'],
+      },
+    },
+    {
+      name: 'edit_recurring',
+      description: 'Change an existing recurring bill/income (amount, accounts, category, frequency, or next date). Look it up first with recurring_transactions to get its id.',
+      input_schema: {
+        type: 'object',
+        properties: {
+          id: { type: 'string' },
+          patch: {
+            type: 'object',
+            properties: {
+              amount: { type: 'number' },
+              from_account: { type: 'string' },
+              to_account: { type: 'string' },
+              category: { type: 'string' },
+              frequency: { type: 'string', enum: ['weekly', 'biweekly', 'monthly', 'yearly'] },
+              next_on: { type: 'string', description: 'YYYY-MM-DD, the next date it hits' },
+              end_on: { type: 'string', description: 'YYYY-MM-DD, optional' },
+              note: { type: 'string' },
+            },
+          },
+        },
+        required: ['id', 'patch'],
+      },
+    },
+    {
+      name: 'delete_recurring',
+      description: 'Cancel a recurring item (e.g. a subscription the user stopped). Look it up first with recurring_transactions to get its id.',
       input_schema: {
         type: 'object',
         properties: { id: { type: 'string' } },
@@ -580,25 +535,6 @@ export function writeToolDefs() {
         type: 'object',
         properties: { id: { type: 'string' } },
         required: ['id'],
-      },
-    },
-    {
-      name: 'adjust_balance',
-      description: 'Correct an account\'s balance to match what the user says it actually is. Computes the needed change and records it as a visible transaction.',
-      input_schema: {
-        type: 'object',
-        properties: {
-          account: { type: 'string' },
-          target_balance: { type: 'number', description: 'What the balance should actually be' },
-          treat_as: {
-            type: 'string',
-            enum: ['adjustment', 'expense', 'income'],
-            description: '"adjustment" if it\'s just a correction with no income/expense meaning; "expense"/"income" if the difference is a real expense or income the user wants reflected in their totals',
-          },
-          category: { type: 'string', description: 'Required if treat_as is "expense" or "income"' },
-          note: { type: 'string' },
-        },
-        required: ['account', 'target_balance', 'treat_as'],
       },
     },
   ];
